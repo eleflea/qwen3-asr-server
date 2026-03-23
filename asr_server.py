@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
+import logging.config
 import re
 import time
 from contextlib import asynccontextmanager
@@ -21,6 +23,48 @@ QUEUE_MAX_SIZE = 10
 ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
 ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.4
+
+
+def configure_logging() -> None:
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                }
+            },
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "default",
+                    "stream": "ext://sys.stdout",
+                }
+            },
+            "root": {"level": "INFO", "handlers": ["console"]},
+            "loggers": {
+                "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                "uvicorn.error": {
+                    "level": "INFO",
+                    "handlers": ["console"],
+                    "propagate": False,
+                },
+                "uvicorn.access": {
+                    "level": "INFO",
+                    "handlers": ["console"],
+                    "propagate": False,
+                },
+                "fastapi": {"level": "INFO", "handlers": ["console"], "propagate": False},
+            },
+        }
+    )
+
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 
 class TimestampItem(BaseModel):
@@ -101,6 +145,16 @@ def tokenize_context(context: Optional[str]) -> Optional[str]:
     return " ".join(tokens) if tokens else None
 
 
+def equal_timestamp_ratio(timestamps: list[TimestampItem]) -> float:
+    if not timestamps:
+        return 0.0
+
+    equal_count = sum(
+        1 for item in timestamps if abs(float(item.start_time) - float(item.end_time)) < 1e-6
+    )
+    return equal_count / len(timestamps)
+
+
 async def asr_worker(app: FastAPI) -> None:
     queue: asyncio.Queue[ASRTask] = app.state.queue
 
@@ -140,19 +194,37 @@ async def asr_worker(app: FastAPI) -> None:
                 for item in aligned
             ]
 
-            task.future.set_result(
-                ASRResponse(
-                    language=result_language,
-                    text=result.text,
-                    timestamps=timestamps,
+            # When context is provided, many zero-duration aligned tokens indicate likely hallucination.
+            same_ts_ratio = equal_timestamp_ratio(timestamps)
+            if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
+                logger.warning(
+                    "Suspected hallucination: equal_timestamp_ratio=%.2f%%",
+                    same_ts_ratio * 100,
                 )
-            )
+                task.future.set_result(
+                    ASRResponse(
+                        language="None",
+                        text="",
+                        timestamps=[],
+                    )
+                )
+            else:
+                task.future.set_result(
+                    ASRResponse(
+                        language=result_language,
+                        text=result.text,
+                        timestamps=timestamps,
+                    )
+                )
 
             audio_seconds = float(len(audio)) / float(SAMPLE_RATE)
             elapsed_seconds = time.perf_counter() - started_at
             rtfx = (audio_seconds / elapsed_seconds) if elapsed_seconds > 0 else 0.0
-            print(
-                f"[perf] audio={audio_seconds:.2f}s cost={elapsed_seconds:.2f}s RTFx={rtfx:.2f}x"
+            logger.info(
+                "ASR perf: audio=%.2fs cost=%.2fs RTFx=%.2fx",
+                audio_seconds,
+                elapsed_seconds,
+                rtfx,
             )
         except Exception as exc:
             task.future.set_exception(exc)
