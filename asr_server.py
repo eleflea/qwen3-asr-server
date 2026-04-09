@@ -27,8 +27,10 @@ ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
 ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.1
+HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD = 0.8
+SAME_TS_RATIO_EXCLUDED_TOKENS = ["我"]
 SAME_TS_SAMPLE_DIR = Path(__file__).resolve().parent / "same_ts_ratio_samples"
-SAME_TS_SAMPLE_MAX_ENTRIES = 500
+SAME_TS_SAMPLE_MAX_ENTRIES = 100
 
 
 def configure_logging() -> None:
@@ -174,10 +176,27 @@ def equal_timestamp_ratio(timestamps: list[TimestampItem]) -> float:
     if not timestamps:
         return 0.0
 
+    effective_timestamps = [
+        item for item in timestamps if item.text not in SAME_TS_RATIO_EXCLUDED_TOKENS
+    ]
+    if not effective_timestamps:
+        return 0.0
+
     equal_count = sum(
-        1 for item in timestamps if abs(float(item.start_time) - float(item.end_time)) < 1e-6
+        1
+        for item in effective_timestamps
+        if abs(float(item.start_time) - float(item.end_time)) < 1e-6
     )
-    return equal_count / len(timestamps)
+    return equal_count / len(effective_timestamps)
+
+
+def same_timestamp_tokens(timestamps: list[TimestampItem]) -> list[str]:
+    return [
+        item.text
+        for item in timestamps
+        if item.text not in SAME_TS_RATIO_EXCLUDED_TOKENS
+        if abs(float(item.start_time) - float(item.end_time)) < 1e-6
+    ]
 
 
 def _prune_old_same_ts_samples(sample_dir: Path, max_entries: int) -> None:
@@ -205,6 +224,7 @@ def save_same_ts_sample(
     context: Optional[str],
     normalized_context: Optional[str],
     retried_without_context: bool,
+    first_response_before_retry: Optional[ASRResponse],
 ) -> None:
     SAME_TS_SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -246,16 +266,32 @@ def save_same_ts_sample(
         },
         "runtime": {
             "hallucination_equal_ts_ratio_threshold": HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD,
+            "high_confidence_equal_ts_ratio_threshold": HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD,
+            "same_ts_ratio_excluded_tokens": SAME_TS_RATIO_EXCLUDED_TOKENS,
             "retried_without_context": retried_without_context,
             "asr_model_id": ASR_MODEL_ID,
             "aligner_model_id": ALIGNER_MODEL_ID,
         },
-        "response": {
-            "language": response.language,
-            "text": response.text,
-            "timestamps": [item.model_dump() for item in response.timestamps],
-        },
     }
+
+    final_response_payload = {
+        "language": response.language,
+        "text": response.text,
+        "timestamps": [item.model_dump() for item in response.timestamps],
+        "same_ts_token": same_timestamp_tokens(response.timestamps),
+    }
+
+    if retried_without_context and first_response_before_retry is not None:
+        txt_payload["response_before_retry"] = {
+            "language": first_response_before_retry.language,
+            "text": first_response_before_retry.text,
+            "timestamps": [item.model_dump() for item in first_response_before_retry.timestamps],
+            "same_ts_token": same_timestamp_tokens(first_response_before_retry.timestamps),
+        }
+        txt_payload["response_after_retry"] = final_response_payload
+    else:
+        txt_payload["response"] = final_response_payload
+
     txt_path.write_text(json.dumps(txt_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     _prune_old_same_ts_samples(SAME_TS_SAMPLE_DIR, SAME_TS_SAMPLE_MAX_ENTRIES)
@@ -300,6 +336,12 @@ async def asr_worker(app: FastAPI) -> None:
                 for item in aligned
             ]
 
+            first_response = ASRResponse(
+                language=result_language,
+                text=result.text,
+                timestamps=timestamps,
+            )
+
             # When context is provided, many zero-duration aligned tokens indicate likely hallucination.
             same_ts_ratio = equal_timestamp_ratio(timestamps)
             retried_without_context = False
@@ -310,51 +352,58 @@ async def asr_worker(app: FastAPI) -> None:
                 )
 
             if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
-                logger.warning(
-                    "Suspected hallucination: equal_timestamp_ratio=%.2f%%; retrying without context",
-                    same_ts_ratio * 100,
-                )
-                retried_without_context = True
-
-                retry_generate_kwargs = {}
-                if task.language:
-                    retry_generate_kwargs["language"] = task.language
-
-                try:
-                    retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
-                except TypeError:
-                    # Some model builds may not support a language argument.
-                    retry_generate_kwargs.pop("language", None)
-                    retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
-
-                retry_language = (
-                    task.language or getattr(retry_result, "language", [None])[0] or "English"
-                )
-                retry_aligned = app.state.aligner.generate(
-                    audio=audio,
-                    text=retry_result.text,
-                    language=retry_language,
-                )
-                retry_timestamps = [
-                    TimestampItem(
-                        start_time=float(item.start_time),
-                        end_time=float(item.end_time),
-                        text=item.text,
+                if same_ts_ratio > HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD:
+                    logger.warning(
+                        "High-confidence hallucination: equal_timestamp_ratio=%.2f%%; returning empty result",
+                        same_ts_ratio * 100,
                     )
-                    for item in retry_aligned
-                ]
+                    final_response = ASRResponse(
+                        language="None",
+                        text="",
+                        timestamps=[],
+                    )
+                else:
+                    logger.warning(
+                        "Suspected hallucination: equal_timestamp_ratio=%.2f%%; retrying without context",
+                        same_ts_ratio * 100,
+                    )
+                    retried_without_context = True
 
-                final_response = ASRResponse(
-                    language=retry_language,
-                    text=retry_result.text,
-                    timestamps=retry_timestamps,
-                )
+                    retry_generate_kwargs = {}
+                    if task.language:
+                        retry_generate_kwargs["language"] = task.language
+
+                    try:
+                        retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
+                    except TypeError:
+                        # Some model builds may not support a language argument.
+                        retry_generate_kwargs.pop("language", None)
+                        retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
+
+                    retry_language = (
+                        task.language or getattr(retry_result, "language", [None])[0] or "English"
+                    )
+                    retry_aligned = app.state.aligner.generate(
+                        audio=audio,
+                        text=retry_result.text,
+                        language=retry_language,
+                    )
+                    retry_timestamps = [
+                        TimestampItem(
+                            start_time=float(item.start_time),
+                            end_time=float(item.end_time),
+                            text=item.text,
+                        )
+                        for item in retry_aligned
+                    ]
+
+                    final_response = ASRResponse(
+                        language=retry_language,
+                        text=retry_result.text,
+                        timestamps=retry_timestamps,
+                    )
             else:
-                final_response = ASRResponse(
-                    language=result_language,
-                    text=result.text,
-                    timestamps=timestamps,
-                )
+                final_response = first_response
 
             if same_ts_ratio > 0:
                 try:
@@ -367,6 +416,9 @@ async def asr_worker(app: FastAPI) -> None:
                         context=task.context,
                         normalized_context=normalized_context,
                         retried_without_context=retried_without_context,
+                        first_response_before_retry=(
+                            first_response if retried_without_context else None
+                        ),
                     )
                 except Exception:
                     logger.exception("Failed to save same_ts_ratio sample")
