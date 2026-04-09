@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import logging.config
 import re
 import time
+import wave
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,8 @@ ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
 ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.1
+SAME_TS_SAMPLE_DIR = Path(__file__).resolve().parent / "same_ts_ratio_samples"
+SAME_TS_SAMPLE_MAX_ENTRIES = 500
 
 
 def configure_logging() -> None:
@@ -176,6 +180,87 @@ def equal_timestamp_ratio(timestamps: list[TimestampItem]) -> float:
     return equal_count / len(timestamps)
 
 
+def _prune_old_same_ts_samples(sample_dir: Path, max_entries: int) -> None:
+    txt_files = sorted(sample_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime)
+    overflow = len(txt_files) - max_entries
+    if overflow <= 0:
+        return
+
+    for txt_file in txt_files[:overflow]:
+        wav_file = sample_dir / f"{txt_file.stem}.wav"
+        try:
+            txt_file.unlink(missing_ok=True)
+            wav_file.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Failed to prune same_ts_ratio sample: %s", txt_file.stem)
+
+
+def save_same_ts_sample(
+    audio: np.ndarray,
+    response: ASRResponse,
+    same_ts_ratio: float,
+    *,
+    filename: Optional[str],
+    language: Optional[str],
+    context: Optional[str],
+    normalized_context: Optional[str],
+    retried_without_context: bool,
+) -> None:
+    SAME_TS_SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    ratio_str = f"{same_ts_ratio:.6f}"
+    base_name = f"{timestamp}_{ratio_str}"
+
+    suffix = 0
+    while True:
+        name = base_name if suffix == 0 else f"{base_name}_{suffix}"
+        wav_path = SAME_TS_SAMPLE_DIR / f"{name}.wav"
+        txt_path = SAME_TS_SAMPLE_DIR / f"{name}.txt"
+        if not wav_path.exists() and not txt_path.exists():
+            break
+        suffix += 1
+
+    pcm = np.clip(audio, -1.0, 1.0)
+    pcm16 = np.asarray(pcm * 32767.0, dtype=np.int16)
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(pcm16.tobytes())
+
+    txt_payload = {
+        "saved_at": timestamp,
+        "same_ts_ratio": round(float(same_ts_ratio), 6),
+        "audio": {
+            "file": wav_path.name,
+            "sample_rate": SAMPLE_RATE,
+            "num_samples": int(len(audio)),
+            "duration_seconds": float(len(audio)) / float(SAMPLE_RATE),
+        },
+        "request": {
+            "filename": filename,
+            "language": language,
+            "context": context,
+            "normalized_context": normalized_context,
+        },
+        "runtime": {
+            "hallucination_equal_ts_ratio_threshold": HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD,
+            "retried_without_context": retried_without_context,
+            "asr_model_id": ASR_MODEL_ID,
+            "aligner_model_id": ALIGNER_MODEL_ID,
+        },
+        "response": {
+            "language": response.language,
+            "text": response.text,
+            "timestamps": [item.model_dump() for item in response.timestamps],
+        },
+    }
+    txt_path.write_text(json.dumps(txt_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    _prune_old_same_ts_samples(SAME_TS_SAMPLE_DIR, SAME_TS_SAMPLE_MAX_ENTRIES)
+
+
 async def asr_worker(app: FastAPI) -> None:
     queue: asyncio.Queue[ASRTask] = app.state.queue
 
@@ -217,16 +302,19 @@ async def asr_worker(app: FastAPI) -> None:
 
             # When context is provided, many zero-duration aligned tokens indicate likely hallucination.
             same_ts_ratio = equal_timestamp_ratio(timestamps)
+            retried_without_context = False
             if normalized_context and 0 < same_ts_ratio < HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
                 logger.warning(
                     "Equal_timestamp_ratio=%.2f%%; result may be partially hallucinated",
                     same_ts_ratio * 100,
                 )
+
             if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
                 logger.warning(
                     "Suspected hallucination: equal_timestamp_ratio=%.2f%%; retrying without context",
                     same_ts_ratio * 100,
                 )
+                retried_without_context = True
 
                 retry_generate_kwargs = {}
                 if task.language:
@@ -256,21 +344,34 @@ async def asr_worker(app: FastAPI) -> None:
                     for item in retry_aligned
                 ]
 
-                task.future.set_result(
-                    ASRResponse(
-                        language=retry_language,
-                        text=retry_result.text,
-                        timestamps=retry_timestamps,
-                    )
+                final_response = ASRResponse(
+                    language=retry_language,
+                    text=retry_result.text,
+                    timestamps=retry_timestamps,
                 )
             else:
-                task.future.set_result(
-                    ASRResponse(
-                        language=result_language,
-                        text=result.text,
-                        timestamps=timestamps,
-                    )
+                final_response = ASRResponse(
+                    language=result_language,
+                    text=result.text,
+                    timestamps=timestamps,
                 )
+
+            if same_ts_ratio > 0:
+                try:
+                    save_same_ts_sample(
+                        audio,
+                        final_response,
+                        same_ts_ratio,
+                        filename=task.filename,
+                        language=task.language,
+                        context=task.context,
+                        normalized_context=normalized_context,
+                        retried_without_context=retried_without_context,
+                    )
+                except Exception:
+                    logger.exception("Failed to save same_ts_ratio sample")
+
+            task.future.set_result(final_response)
 
             audio_seconds = float(len(audio)) / float(SAMPLE_RATE)
             elapsed_seconds = time.perf_counter() - started_at
