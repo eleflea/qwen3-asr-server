@@ -8,6 +8,7 @@ import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import jieba
@@ -23,10 +24,14 @@ QUEUE_MAX_SIZE = 10
 ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
 ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
-HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.4
+HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.1
 
 
 def configure_logging() -> None:
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "asr_server.log"
+
     logging.config.dictConfig(
         {
             "version": 1,
@@ -42,22 +47,38 @@ def configure_logging() -> None:
                     "class": "logging.StreamHandler",
                     "formatter": "default",
                     "stream": "ext://sys.stdout",
+                },
+                "file": {
+                    "class": "logging.handlers.RotatingFileHandler",
+                    "formatter": "default",
+                    "filename": str(log_file),
+                    "maxBytes": 20 * 1024 * 1024,
+                    "backupCount": 5,
+                    "encoding": "utf-8",
                 }
             },
-            "root": {"level": "INFO", "handlers": ["console"]},
+            "root": {"level": "INFO", "handlers": ["console", "file"]},
             "loggers": {
-                "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                "uvicorn": {
+                    "level": "INFO",
+                    "handlers": ["console", "file"],
+                    "propagate": False,
+                },
                 "uvicorn.error": {
                     "level": "INFO",
-                    "handlers": ["console"],
+                    "handlers": ["console", "file"],
                     "propagate": False,
                 },
                 "uvicorn.access": {
                     "level": "INFO",
-                    "handlers": ["console"],
+                    "handlers": ["console", "file"],
                     "propagate": False,
                 },
-                "fastapi": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                "fastapi": {
+                    "level": "INFO",
+                    "handlers": ["console", "file"],
+                    "propagate": False,
+                },
             },
         }
     )
@@ -196,16 +217,50 @@ async def asr_worker(app: FastAPI) -> None:
 
             # When context is provided, many zero-duration aligned tokens indicate likely hallucination.
             same_ts_ratio = equal_timestamp_ratio(timestamps)
-            if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
+            if normalized_context and 0 < same_ts_ratio < HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
                 logger.warning(
-                    "Suspected hallucination: equal_timestamp_ratio=%.2f%%",
+                    "Equal_timestamp_ratio=%.2f%%; result may be partially hallucinated",
                     same_ts_ratio * 100,
                 )
+            if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
+                logger.warning(
+                    "Suspected hallucination: equal_timestamp_ratio=%.2f%%; retrying without context",
+                    same_ts_ratio * 100,
+                )
+
+                retry_generate_kwargs = {}
+                if task.language:
+                    retry_generate_kwargs["language"] = task.language
+
+                try:
+                    retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
+                except TypeError:
+                    # Some model builds may not support a language argument.
+                    retry_generate_kwargs.pop("language", None)
+                    retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
+
+                retry_language = (
+                    task.language or getattr(retry_result, "language", [None])[0] or "English"
+                )
+                retry_aligned = app.state.aligner.generate(
+                    audio=audio,
+                    text=retry_result.text,
+                    language=retry_language,
+                )
+                retry_timestamps = [
+                    TimestampItem(
+                        start_time=float(item.start_time),
+                        end_time=float(item.end_time),
+                        text=item.text,
+                    )
+                    for item in retry_aligned
+                ]
+
                 task.future.set_result(
                     ASRResponse(
-                        language="None",
-                        text="",
-                        timestamps=[],
+                        language=retry_language,
+                        text=retry_result.text,
+                        timestamps=retry_timestamps,
                     )
                 )
             else:
