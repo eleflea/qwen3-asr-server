@@ -31,6 +31,7 @@ HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD = 0.8
 SAME_TS_RATIO_EXCLUDED_TOKENS = ["我"]
 SAME_TS_SAMPLE_DIR = Path(__file__).resolve().parent / "same_ts_ratio_samples"
 SAME_TS_SAMPLE_MAX_ENTRIES = 100
+SAVE_SAME_TS_SAMPLES = False
 
 
 def configure_logging() -> None:
@@ -303,6 +304,21 @@ async def asr_worker(app: FastAPI) -> None:
     while True:
         task = await queue.get()
         started_at = time.perf_counter()
+        if len(task.audio_bytes) < 400:
+            logger.warning(
+                "Audio payload too small (%d bytes); returning empty result",
+                len(task.audio_bytes),
+            )
+            task.future.set_result(
+                ASRResponse(
+                    language="None",
+                    text="",
+                    timestamps=[],
+                )
+            )
+            queue.task_done()
+            continue
+
         try:
             audio = load_audio_from_bytes(task.audio_bytes, task.filename)
             normalized_context = tokenize_context(task.context)
@@ -405,7 +421,7 @@ async def asr_worker(app: FastAPI) -> None:
             else:
                 final_response = first_response
 
-            if same_ts_ratio > 0:
+            if SAVE_SAME_TS_SAMPLES and 0.05 < same_ts_ratio < HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD:
                 try:
                     save_same_ts_sample(
                         audio,
