@@ -25,6 +25,7 @@ SAMPLE_RATE = 16000
 QUEUE_MAX_SIZE = 10
 ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
 ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+MIN_AUDIO_RMS = 1e-3
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.1
 HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD = 0.8
@@ -146,6 +147,30 @@ def load_audio_from_bytes(
         audio = resample_audio(audio, sample_rate, sr)
 
     return np.array(audio, dtype=dtype).mean(axis=1)
+
+
+def audio_rms(audio: np.ndarray) -> float:
+    if audio.size == 0:
+        return 0.0
+
+    samples = audio.astype(np.float64, copy=False)
+    return float(np.sqrt(np.mean(samples * samples)))
+
+
+def set_future_result(future: asyncio.Future, response: ASRResponse) -> None:
+    if future.done():
+        logger.info("ASR future already done; dropping result")
+        return
+
+    future.set_result(response)
+
+
+def set_future_exception(future: asyncio.Future, exc: Exception) -> None:
+    if future.done():
+        logger.info("ASR future already done; dropping exception")
+        return
+
+    future.set_exception(exc)
 
 
 def tokenize_context(context: Optional[str]) -> Optional[str]:
@@ -304,23 +329,46 @@ async def asr_worker(app: FastAPI) -> None:
     while True:
         task = await queue.get()
         started_at = time.perf_counter()
+        if task.future.cancelled():
+            logger.info("Skipping cancelled ASR task before processing")
+            queue.task_done()
+            continue
+
         if len(task.audio_bytes) < 400:
             logger.warning(
                 "Audio payload too small (%d bytes); returning empty result",
                 len(task.audio_bytes),
             )
-            task.future.set_result(
+            set_future_result(
+                task.future,
                 ASRResponse(
                     language="None",
                     text="",
                     timestamps=[],
-                )
+                ),
             )
             queue.task_done()
             continue
 
         try:
             audio = load_audio_from_bytes(task.audio_bytes, task.filename)
+            rms = audio_rms(audio)
+            if rms < MIN_AUDIO_RMS:
+                logger.warning(
+                    "Audio RMS too low (%.8f < %.8f); returning empty result",
+                    rms,
+                    MIN_AUDIO_RMS,
+                )
+                set_future_result(
+                    task.future,
+                    ASRResponse(
+                        language="None",
+                        text="",
+                        timestamps=[],
+                    )
+                )
+                continue
+
             normalized_context = tokenize_context(task.context)
 
             generate_kwargs = {}
@@ -330,6 +378,7 @@ async def asr_worker(app: FastAPI) -> None:
                 generate_kwargs["language"] = task.language
 
             try:
+                logger.info("ASR generate started: audio=%.2fs rms=%.8f", len(audio) / SAMPLE_RATE, rms)
                 result = app.state.model.generate(audio, **generate_kwargs)
             except TypeError:
                 # Some model builds may not support a language argument.
@@ -337,6 +386,7 @@ async def asr_worker(app: FastAPI) -> None:
                 result = app.state.model.generate(audio, **generate_kwargs)
 
             result_language = task.language or getattr(result, "language", [None])[0] or "English"
+            logger.info("ASR align started: text_chars=%d language=%s", len(result.text), result_language)
             aligned = app.state.aligner.generate(
                 audio=audio,
                 text=result.text,
@@ -390,6 +440,7 @@ async def asr_worker(app: FastAPI) -> None:
                         retry_generate_kwargs["language"] = task.language
 
                     try:
+                        logger.info("ASR retry generate started without context")
                         retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
                     except TypeError:
                         # Some model builds may not support a language argument.
@@ -398,6 +449,11 @@ async def asr_worker(app: FastAPI) -> None:
 
                     retry_language = (
                         task.language or getattr(retry_result, "language", [None])[0] or "English"
+                    )
+                    logger.info(
+                        "ASR retry align started: text_chars=%d language=%s",
+                        len(retry_result.text),
+                        retry_language,
                     )
                     retry_aligned = app.state.aligner.generate(
                         audio=audio,
@@ -439,7 +495,7 @@ async def asr_worker(app: FastAPI) -> None:
                 except Exception:
                     logger.exception("Failed to save same_ts_ratio sample")
 
-            task.future.set_result(final_response)
+            set_future_result(task.future, final_response)
 
             audio_seconds = float(len(audio)) / float(SAMPLE_RATE)
             elapsed_seconds = time.perf_counter() - started_at
@@ -451,7 +507,7 @@ async def asr_worker(app: FastAPI) -> None:
                 rtfx,
             )
         except Exception as exc:
-            task.future.set_exception(exc)
+            set_future_exception(task.future, exc)
         finally:
             queue.task_done()
 
