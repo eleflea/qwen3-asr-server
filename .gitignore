@@ -16,6 +16,7 @@ dist/
 # Tool caches
 .pytest_cache/
 .mypy_cache/
+.models/
 
 # Environment variables
 .env
@@ -27,3 +28,6 @@ dist/
 # logs
 logs/*
 same_ts_ratio_samples/*
+
+# data
+data/

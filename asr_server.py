@@ -5,7 +5,9 @@ import io
 import json
 import logging
 import logging.config
+import os
 import re
+import shutil
 import time
 import wave
 from contextlib import asynccontextmanager
@@ -23,8 +25,13 @@ from scipy import signal
 
 SAMPLE_RATE = 16000
 QUEUE_MAX_SIZE = 10
-ASR_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
-ALIGNER_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+ASR_MODEL_ID = "aufklarer/Qwen3-ASR-1.7B-MLX-5bit"
+ALIGNER_MODEL_ID = "aufklarer/Qwen3-ForcedAligner-0.6B-8bit"
+MODEL_OVERLAY_DIR = Path(__file__).resolve().parent / ".models"
+ASR_COMPAT_MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
+ALIGNER_COMPAT_MODEL_ID = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+ASR_OVERLAY_PATH = MODEL_OVERLAY_DIR / "Qwen3-ASR-1.7B-MLX-5bit-overlay"
+ALIGNER_OVERLAY_PATH = MODEL_OVERLAY_DIR / "Qwen3-ForcedAligner-0.6B-8bit-overlay"
 MIN_AUDIO_RMS = 1e-3
 CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD = 0.1
@@ -131,6 +138,47 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
     return signal.resample_poly(audio, up, down, padtype="edge")
 
 
+def _looks_like_mp3_frame(data: bytes) -> bool:
+    if len(data) < 2 or data[0] != 0xFF:
+        return False
+
+    return (data[1] & 0xE0) == 0xE0
+
+
+def _decode_audio_with_miniaudio(
+    data: bytes,
+    *,
+    filename: Optional[str],
+    always_2d: bool,
+) -> tuple[np.ndarray, int]:
+    import miniaudio
+
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".mp3" or data[:3] == b"ID3" or _looks_like_mp3_frame(data):
+        info = miniaudio.mp3_get_info(data)
+    elif suffix == ".wav" or (data[:4] == b"RIFF" and data[8:12] == b"WAVE"):
+        info = miniaudio.wav_get_info(data)
+    elif suffix == ".flac" or data[:4] == b"fLaC":
+        info = miniaudio.flac_get_info(data)
+    elif suffix in {".ogg", ".oga"} or data[:4] == b"OggS":
+        info = miniaudio.vorbis_get_info(data)
+    else:
+        raise ValueError("Unable to detect audio format from bytes")
+
+    decoded = miniaudio.decode(
+        data,
+        nchannels=info.nchannels,
+        sample_rate=info.sample_rate,
+    )
+    samples = np.array(decoded.samples, dtype=np.int16)
+    if decoded.nchannels > 1:
+        samples = samples.reshape(-1, decoded.nchannels)
+    samples = samples.astype(np.float64) / 32768.0
+    if always_2d and samples.ndim == 1:
+        samples = samples[:, np.newaxis]
+    return samples, decoded.sample_rate
+
+
 def load_audio_from_bytes(
     data: bytes,
     filename: Optional[str],
@@ -142,11 +190,138 @@ def load_audio_from_bytes(
     if filename:
         buffer.name = filename
 
-    audio, sample_rate = audio_read(buffer, always_2d=True)
+    try:
+        audio, sample_rate = audio_read(buffer, always_2d=True)
+    except ValueError as exc:
+        logger.info("Falling back to local audio byte decoder: %s", exc)
+        audio, sample_rate = _decode_audio_with_miniaudio(
+            data,
+            filename=filename,
+            always_2d=True,
+        )
+
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
 
     return np.array(audio, dtype=dtype).mean(axis=1)
+
+
+def _copy_or_link_model_files(
+    src_dir: Path,
+    overlay_dir: Path,
+    names: list[str],
+    *,
+    symlink: bool,
+) -> None:
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        src = src_dir / name
+        if not src.exists():
+            continue
+
+        dst = overlay_dir / name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+
+        if symlink:
+            os.symlink(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+
+def _merge_quantize_config(overlay_dir: Path) -> None:
+    config_path = overlay_dir / "config.json"
+    quantize_path = overlay_dir / "quantize_config.json"
+    if not config_path.exists() or not quantize_path.exists():
+        return
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("quantization") or config.get("quantization_config"):
+        return
+
+    quantize_config = json.loads(quantize_path.read_text(encoding="utf-8"))
+    quantization = quantize_config.get("quantization")
+    if not quantization:
+        return
+
+    config["quantization"] = {
+        "group_size": quantization.get("group_size", 64),
+        "bits": quantization["bits"],
+    }
+    if config_path.is_symlink():
+        config_path.unlink()
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def prepare_model_overlay(
+    model_id: str,
+    compat_model_id: str,
+    overlay_dir: Path,
+    *,
+    allow_patterns: list[str],
+) -> Path:
+    """Build a local model overlay for HF repos missing preprocessor_config.json."""
+    if (overlay_dir / "model.safetensors").exists() and (
+        overlay_dir / "preprocessor_config.json"
+    ).exists():
+        _merge_quantize_config(overlay_dir)
+        return overlay_dir
+
+    from huggingface_hub import snapshot_download
+
+    model_dir = Path(snapshot_download(model_id, allow_patterns=allow_patterns))
+    compat_dir = Path(
+        snapshot_download(
+            compat_model_id,
+            allow_patterns=[
+                "preprocessor_config.json",
+                "generation_config.json",
+                "chat_template.json",
+            ],
+        )
+    )
+
+    _copy_or_link_model_files(model_dir, overlay_dir, allow_patterns, symlink=True)
+    _copy_or_link_model_files(
+        compat_dir,
+        overlay_dir,
+        ["preprocessor_config.json", "generation_config.json", "chat_template.json"],
+        symlink=False,
+    )
+    _merge_quantize_config(overlay_dir)
+    return overlay_dir
+
+
+def resolve_model_paths() -> tuple[str, str]:
+    asr_path = prepare_model_overlay(
+        ASR_MODEL_ID,
+        ASR_COMPAT_MODEL_ID,
+        ASR_OVERLAY_PATH,
+        allow_patterns=[
+            "config.json",
+            "model.safetensors",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+        ],
+    )
+    aligner_path = prepare_model_overlay(
+        ALIGNER_MODEL_ID,
+        ALIGNER_COMPAT_MODEL_ID,
+        ALIGNER_OVERLAY_PATH,
+        allow_patterns=[
+            "config.json",
+            "model.safetensors",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "quantize_config.json",
+        ],
+    )
+    return str(asr_path), str(aligner_path)
 
 
 def audio_rms(audio: np.ndarray) -> float:
@@ -515,8 +690,11 @@ async def asr_worker(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
-    app.state.model = load(ASR_MODEL_ID)
-    app.state.aligner = load(ALIGNER_MODEL_ID)
+    asr_model_path, aligner_model_path = resolve_model_paths()
+    logger.info("Loading ASR model from %s", asr_model_path)
+    app.state.model = load(asr_model_path)
+    logger.info("Loading aligner model from %s", aligner_model_path)
+    app.state.aligner = load(aligner_model_path)
     app.state.worker = asyncio.create_task(asr_worker(app))
 
     try:
