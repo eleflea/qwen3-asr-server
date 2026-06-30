@@ -180,6 +180,20 @@ def _looks_like_mp3_frame(data: bytes) -> bool:
     return (data[1] & 0xE0) == 0xE0
 
 
+def _should_decode_with_miniaudio(data: bytes, filename: Optional[str]) -> bool:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in {".mp3", ".wav", ".flac", ".ogg", ".oga"}:
+        return True
+
+    return (
+        data[:3] == b"ID3"
+        or _looks_like_mp3_frame(data)
+        or (data[:4] == b"RIFF" and data[8:12] == b"WAVE")
+        or data[:4] == b"fLaC"
+        or data[:4] == b"OggS"
+    )
+
+
 def _decode_audio_with_miniaudio(
     data: bytes,
     *,
@@ -220,20 +234,27 @@ def load_audio_from_bytes(
     sr: int = SAMPLE_RATE,
     dtype=np.float32,
 ) -> np.ndarray:
-    buffer = io.BytesIO(data)
-    # Keep filename for compatibility with callers; decoding is fully in-memory.
-    if filename:
-        buffer.name = filename
-
-    try:
-        audio, sample_rate = audio_read(buffer, always_2d=True)
-    except ValueError as exc:
-        logger.info("Falling back to local audio byte decoder: %s", exc)
+    if _should_decode_with_miniaudio(data, filename):
         audio, sample_rate = _decode_audio_with_miniaudio(
             data,
             filename=filename,
             always_2d=True,
         )
+    else:
+        buffer = io.BytesIO(data)
+        # Keep filename for compatibility with callers; decoding is fully in-memory.
+        if filename:
+            buffer.name = filename
+
+        try:
+            audio, sample_rate = audio_read(buffer, always_2d=True)
+        except ValueError as exc:
+            logger.info("Falling back to local audio byte decoder: %s", exc)
+            audio, sample_rate = _decode_audio_with_miniaudio(
+                data,
+                filename=filename,
+                always_2d=True,
+            )
 
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
@@ -740,6 +761,20 @@ async def asr_worker(app: FastAPI) -> None:
                 format_timing_breakdown(timings, elapsed_seconds),
             )
         except Exception as exc:
+            elapsed_seconds = time.perf_counter() - started_at
+            audio_seconds = (
+                float(len(audio)) / float(SAMPLE_RATE)
+                if "audio" in locals()
+                else 0.0
+            )
+            rtfx = (audio_seconds / elapsed_seconds) if elapsed_seconds > 0 else 0.0
+            logger.exception(
+                "ASR failed: audio=%.2fs cost=%.2fs RTFx=%.2fx stages: %s",
+                audio_seconds,
+                elapsed_seconds,
+                rtfx,
+                format_timing_breakdown(timings, elapsed_seconds),
+            )
             set_future_exception(task.future, exc)
         finally:
             queue.task_done()
