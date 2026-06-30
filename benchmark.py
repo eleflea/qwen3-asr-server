@@ -11,15 +11,29 @@ from asr_server import (
     HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD,
     SAMPLE_RATE,
     TimestampItem,
+    add_timing,
     audio_rms,
     equal_timestamp_ratio,
+    format_timing_breakdown,
     load_audio_from_bytes,
     resolve_model_paths,
     tokenize_context,
 )
 
 
-def transcribe_one(model, aligner, audio, *, language: str | None, context: str | None):
+def transcribe_one(
+    model,
+    aligner,
+    audio,
+    *,
+    language: str | None,
+    context: str | None,
+    timings: dict[str, float] | None = None,
+):
+    if timings is None:
+        timings = {}
+
+    stage_started_at = time.perf_counter()
     normalized_context = tokenize_context(context)
 
     generate_kwargs = {}
@@ -27,15 +41,22 @@ def transcribe_one(model, aligner, audio, *, language: str | None, context: str 
         generate_kwargs["system_prompt"] = normalized_context
     if language:
         generate_kwargs["language"] = language
+    add_timing(timings, "preprocess", time.perf_counter() - stage_started_at)
 
+    stage_started_at = time.perf_counter()
     try:
         result = model.generate(audio, **generate_kwargs)
     except TypeError:
         generate_kwargs.pop("language", None)
         result = model.generate(audio, **generate_kwargs)
+    add_timing(timings, "asr", time.perf_counter() - stage_started_at)
 
     result_language = language or getattr(result, "language", [None])[0] or "English"
+    stage_started_at = time.perf_counter()
     aligned = aligner.generate(audio=audio, text=result.text, language=result_language)
+    add_timing(timings, "aligner", time.perf_counter() - stage_started_at)
+
+    stage_started_at = time.perf_counter()
     timestamps = [
         TimestampItem(
             start_time=float(item.start_time),
@@ -46,22 +67,33 @@ def transcribe_one(model, aligner, audio, *, language: str | None, context: str 
     ]
 
     same_ts_ratio = equal_timestamp_ratio(timestamps)
+    add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
+
+    stage_started_at = time.perf_counter()
     if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
         if same_ts_ratio > HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD:
+            add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
             return result_language, "", [], same_ts_ratio
 
         retry_kwargs = {}
         if language:
             retry_kwargs["language"] = language
+        add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
 
+        stage_started_at = time.perf_counter()
         try:
             result = model.generate(audio, **retry_kwargs)
         except TypeError:
             retry_kwargs.pop("language", None)
             result = model.generate(audio, **retry_kwargs)
+        add_timing(timings, "asr", time.perf_counter() - stage_started_at)
 
         result_language = language or getattr(result, "language", [None])[0] or "English"
+        stage_started_at = time.perf_counter()
         aligned = aligner.generate(audio=audio, text=result.text, language=result_language)
+        add_timing(timings, "aligner", time.perf_counter() - stage_started_at)
+
+        stage_started_at = time.perf_counter()
         timestamps = [
             TimestampItem(
                 start_time=float(item.start_time),
@@ -70,8 +102,14 @@ def transcribe_one(model, aligner, audio, *, language: str | None, context: str 
             )
             for item in aligned
         ]
+        add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
 
     return result_language, result.text, timestamps, same_ts_ratio
+
+
+def merge_timings(total: dict[str, float], item: dict[str, float]) -> None:
+    for stage, elapsed_seconds in item.items():
+        add_timing(total, stage, elapsed_seconds)
 
 
 def main() -> None:
@@ -94,22 +132,27 @@ def main() -> None:
 
     total_audio_seconds = 0.0
     total_elapsed_seconds = 0.0
+    total_timings: dict[str, float] = {}
 
     for path in audio_paths:
+        timings: dict[str, float] = {}
+        decode_started_at = time.perf_counter()
         audio = load_audio_from_bytes(path.read_bytes(), path.name)
+        add_timing(timings, "decode", time.perf_counter() - decode_started_at)
         audio_seconds = len(audio) / SAMPLE_RATE
         total_audio_seconds += audio_seconds
 
-        started_at = time.perf_counter()
         language, text, timestamps, same_ts_ratio = transcribe_one(
             model,
             aligner,
             audio,
             language=args.language,
             context=args.context,
+            timings=timings,
         )
-        elapsed_seconds = time.perf_counter() - started_at
+        elapsed_seconds = time.perf_counter() - decode_started_at
         total_elapsed_seconds += elapsed_seconds
+        merge_timings(total_timings, timings)
 
         rtfx = audio_seconds / elapsed_seconds if elapsed_seconds > 0 else 0.0
         print(
@@ -121,6 +164,7 @@ def main() -> None:
             f"lang={language}\t"
             f"tokens={len(timestamps)}\t"
             f"same_ts={same_ts_ratio:.2%}\t"
+            f"stages={format_timing_breakdown(timings, elapsed_seconds)}\t"
             f"text={text[:80]}"
         )
 
@@ -131,7 +175,8 @@ def main() -> None:
         f"TOTAL\tfiles={len(audio_paths)}\t"
         f"audio={total_audio_seconds:.2f}s\t"
         f"cost={total_elapsed_seconds:.2f}s\t"
-        f"RTFx={aggregate_rtfx:.2f}x"
+        f"RTFx={aggregate_rtfx:.2f}x\t"
+        f"stages={format_timing_breakdown(total_timings, total_elapsed_seconds)}"
     )
 
 

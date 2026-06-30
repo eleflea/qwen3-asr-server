@@ -131,6 +131,41 @@ class ASRTask:
     future: asyncio.Future
 
 
+def add_timing(timings: dict[str, float], stage: str, elapsed_seconds: float) -> None:
+    timings[stage] = timings.get(stage, 0.0) + elapsed_seconds
+
+
+def format_timing_breakdown(
+    timings: dict[str, float],
+    total_seconds: float,
+    *,
+    stage_order: Optional[list[str]] = None,
+) -> str:
+    if total_seconds <= 0:
+        total_seconds = sum(timings.values())
+    if total_seconds <= 0:
+        return ""
+
+    ordered_stages = stage_order or [
+        "decode",
+        "preprocess",
+        "asr",
+        "aligner",
+        "postprocess",
+    ]
+    parts = []
+    for stage in ordered_stages:
+        elapsed = timings.get(stage, 0.0)
+        percent = (elapsed / total_seconds) * 100.0
+        parts.append(f"{stage}={elapsed:.3f}s/{percent:.1f}%")
+
+    measured = sum(timings.values())
+    unmeasured = max(total_seconds - measured, 0.0)
+    if unmeasured > 1e-3:
+        parts.append(f"unmeasured={unmeasured:.3f}s/{(unmeasured / total_seconds) * 100.0:.1f}%")
+    return " ".join(parts)
+
+
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     gcd = np.gcd(orig_sr, target_sr)
     up = target_sr // gcd
@@ -504,6 +539,7 @@ async def asr_worker(app: FastAPI) -> None:
     while True:
         task = await queue.get()
         started_at = time.perf_counter()
+        timings: dict[str, float] = {}
         if task.future.cancelled():
             logger.info("Skipping cancelled ASR task before processing")
             queue.task_done()
@@ -526,7 +562,11 @@ async def asr_worker(app: FastAPI) -> None:
             continue
 
         try:
+            stage_started_at = time.perf_counter()
             audio = load_audio_from_bytes(task.audio_bytes, task.filename)
+            add_timing(timings, "decode", time.perf_counter() - stage_started_at)
+
+            stage_started_at = time.perf_counter()
             rms = audio_rms(audio)
             if rms < MIN_AUDIO_RMS:
                 logger.warning(
@@ -551,7 +591,9 @@ async def asr_worker(app: FastAPI) -> None:
                 generate_kwargs["system_prompt"] = normalized_context
             if task.language:
                 generate_kwargs["language"] = task.language
+            add_timing(timings, "preprocess", time.perf_counter() - stage_started_at)
 
+            stage_started_at = time.perf_counter()
             try:
                 logger.info("ASR generate started: audio=%.2fs rms=%.8f", len(audio) / SAMPLE_RATE, rms)
                 result = app.state.model.generate(audio, **generate_kwargs)
@@ -559,15 +601,19 @@ async def asr_worker(app: FastAPI) -> None:
                 # Some model builds may not support a language argument.
                 generate_kwargs.pop("language", None)
                 result = app.state.model.generate(audio, **generate_kwargs)
+            add_timing(timings, "asr", time.perf_counter() - stage_started_at)
 
             result_language = task.language or getattr(result, "language", [None])[0] or "English"
+            stage_started_at = time.perf_counter()
             logger.info("ASR align started: text_chars=%d language=%s", len(result.text), result_language)
             aligned = app.state.aligner.generate(
                 audio=audio,
                 text=result.text,
                 language=result_language,
             )
+            add_timing(timings, "aligner", time.perf_counter() - stage_started_at)
 
+            stage_started_at = time.perf_counter()
             timestamps = [
                 TimestampItem(
                     start_time=float(item.start_time),
@@ -591,7 +637,9 @@ async def asr_worker(app: FastAPI) -> None:
                     "Equal_timestamp_ratio=%.2f%%; result may be partially hallucinated",
                     same_ts_ratio * 100,
                 )
+            add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
 
+            stage_started_at = time.perf_counter()
             if normalized_context and same_ts_ratio > HALLUCINATION_EQUAL_TS_RATIO_THRESHOLD:
                 if same_ts_ratio > HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD:
                     logger.warning(
@@ -613,18 +661,22 @@ async def asr_worker(app: FastAPI) -> None:
                     retry_generate_kwargs = {}
                     if task.language:
                         retry_generate_kwargs["language"] = task.language
+                    add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
 
                     try:
+                        retry_started_at = time.perf_counter()
                         logger.info("ASR retry generate started without context")
                         retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
                     except TypeError:
                         # Some model builds may not support a language argument.
                         retry_generate_kwargs.pop("language", None)
                         retry_result = app.state.model.generate(audio, **retry_generate_kwargs)
+                    add_timing(timings, "asr", time.perf_counter() - retry_started_at)
 
                     retry_language = (
                         task.language or getattr(retry_result, "language", [None])[0] or "English"
                     )
+                    retry_started_at = time.perf_counter()
                     logger.info(
                         "ASR retry align started: text_chars=%d language=%s",
                         len(retry_result.text),
@@ -635,6 +687,8 @@ async def asr_worker(app: FastAPI) -> None:
                         text=retry_result.text,
                         language=retry_language,
                     )
+                    add_timing(timings, "aligner", time.perf_counter() - retry_started_at)
+                    stage_started_at = time.perf_counter()
                     retry_timestamps = [
                         TimestampItem(
                             start_time=float(item.start_time),
@@ -649,9 +703,11 @@ async def asr_worker(app: FastAPI) -> None:
                         text=retry_result.text,
                         timestamps=retry_timestamps,
                     )
+                    add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
             else:
                 final_response = first_response
 
+            stage_started_at = time.perf_counter()
             if SAVE_SAME_TS_SAMPLES and 0.05 < same_ts_ratio < HIGH_CONFIDENCE_EQUAL_TS_RATIO_THRESHOLD:
                 try:
                     save_same_ts_sample(
@@ -671,15 +727,17 @@ async def asr_worker(app: FastAPI) -> None:
                     logger.exception("Failed to save same_ts_ratio sample")
 
             set_future_result(task.future, final_response)
+            add_timing(timings, "postprocess", time.perf_counter() - stage_started_at)
 
             audio_seconds = float(len(audio)) / float(SAMPLE_RATE)
             elapsed_seconds = time.perf_counter() - started_at
             rtfx = (audio_seconds / elapsed_seconds) if elapsed_seconds > 0 else 0.0
             logger.info(
-                "ASR perf: audio=%.2fs cost=%.2fs RTFx=%.2fx",
+                "ASR perf: audio=%.2fs cost=%.2fs RTFx=%.2fx stages: %s",
                 audio_seconds,
                 elapsed_seconds,
                 rtfx,
+                format_timing_breakdown(timings, elapsed_seconds),
             )
         except Exception as exc:
             set_future_exception(task.future, exc)

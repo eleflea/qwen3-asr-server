@@ -11,8 +11,14 @@ from statistics import mean
 
 from mlx_audio.stt import load
 
-from asr_server import SAMPLE_RATE, load_audio_from_bytes, resolve_model_paths
-from benchmark import transcribe_one
+from asr_server import (
+    SAMPLE_RATE,
+    add_timing,
+    format_timing_breakdown,
+    load_audio_from_bytes,
+    resolve_model_paths,
+)
+from benchmark import merge_timings, transcribe_one
 
 
 @dataclass
@@ -24,6 +30,7 @@ class FileResult:
     language: str
     text: str
     timestamps: list[dict]
+    timings: dict[str, float]
 
 
 @dataclass
@@ -35,6 +42,7 @@ class SuiteResult:
     total_audio_seconds: float
     total_elapsed_seconds: float
     rtfx: float
+    timings: dict[str, float]
 
 
 def run_suite(
@@ -52,23 +60,28 @@ def run_suite(
     files: list[FileResult] = []
     total_audio_seconds = 0.0
     total_elapsed_seconds = 0.0
+    total_timings: dict[str, float] = {}
 
     for path in audio_paths:
+        timings: dict[str, float] = {}
+        decode_started_at = time.perf_counter()
         audio = load_audio_from_bytes(path.read_bytes(), path.name)
+        add_timing(timings, "decode", time.perf_counter() - decode_started_at)
         audio_seconds = len(audio) / SAMPLE_RATE
-        started_at = time.perf_counter()
         result_language, text, timestamps, _same_ts_ratio = transcribe_one(
             model,
             aligner,
             audio,
             language=language,
             context=context,
+            timings=timings,
         )
-        elapsed_seconds = time.perf_counter() - started_at
+        elapsed_seconds = time.perf_counter() - decode_started_at
         rtfx = audio_seconds / elapsed_seconds if elapsed_seconds > 0 else 0.0
 
         total_audio_seconds += audio_seconds
         total_elapsed_seconds += elapsed_seconds
+        merge_timings(total_timings, timings)
         files.append(
             FileResult(
                 file=path.name,
@@ -78,12 +91,15 @@ def run_suite(
                 language=result_language,
                 text=text,
                 timestamps=[item.model_dump() for item in timestamps],
+                timings=timings,
             )
         )
         print(
             f"{name}\t{path.name}\t"
             f"audio={audio_seconds:.2f}s\tcost={elapsed_seconds:.2f}s\t"
-            f"RTFx={rtfx:.2f}x\ttokens={len(timestamps)}\t{text[:70]}",
+            f"RTFx={rtfx:.2f}x\ttokens={len(timestamps)}\t"
+            f"stages={format_timing_breakdown(timings, elapsed_seconds)}\t"
+            f"{text[:70]}",
             flush=True,
         )
 
@@ -109,6 +125,7 @@ def run_suite(
             if total_elapsed_seconds > 0
             else 0.0
         ),
+        timings=total_timings,
     )
 
 
